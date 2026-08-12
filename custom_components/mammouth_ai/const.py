@@ -16,7 +16,7 @@ CONF_BASE_CONTEXT = "base_context"
 
 # Valeurs par défaut
 DEFAULT_BASE_URL = "https://api.mammouth.ai/v1"
-DEFAULT_MODEL = "mammouth-default"
+DEFAULT_MODEL = "mammouth-recommended"
 DEFAULT_MAX_TOKENS = 1000
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TIMEOUT = 30

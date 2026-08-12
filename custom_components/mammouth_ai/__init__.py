@@ -6,7 +6,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import MammouthDataUpdateCoordinator
@@ -25,6 +25,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Test de connexion initial
     try:
         await coordinator.async_validate_connection()
+    except ConfigEntryAuthFailed:
+        # Ne pas masquer : ça déclenche le flux "reauthentifier" natif de HA
+        # (demander une nouvelle clé API), bien plus clair pour l'utilisateur
+        # qu'un simple "l'intégration n'a pas pu démarrer".
+        raise
     except Exception as err:
         _LOGGER.error("Failed to connect to Mammouth AI: %s", err)
         raise ConfigEntryNotReady(

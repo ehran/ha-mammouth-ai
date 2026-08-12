@@ -57,6 +57,12 @@ class MammouthDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Fetch data from API endpoint."""
         try:
             return await self._async_health_check()
+        except ConfigEntryAuthFailed:
+            # Laisser filer : c'est ce signal précis qui déclenche le flux de
+            # reauthentification natif de HA (demander une nouvelle clé API).
+            # Le masquer en UpdateFailed dégraderait silencieusement au lieu
+            # de guider l'utilisateur vers la vraie cause.
+            raise
         except Exception as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
 
@@ -141,6 +147,11 @@ class MammouthDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             raise HomeAssistantError(ERROR_TIMEOUT) from err
         except aiohttp.ClientError as err:
             raise HomeAssistantError(ERROR_CONNECT) from err
+        except ConfigEntryAuthFailed:
+            # Ne pas masquer : c'est une info précise (clé API invalide) que
+            # l'utilisateur et l'appelant doivent voir telle quelle, pas noyée
+            # dans un message générique "Erreur inconnue".
+            raise
         except Exception as err:
             _LOGGER.error("Chat completion failed: %s", err)
             raise HomeAssistantError(ERROR_UNKNOWN) from err

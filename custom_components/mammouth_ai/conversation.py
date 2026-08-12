@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Literal
 
 from homeassistant.components.conversation import (
@@ -20,7 +19,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, TemplateError
 from homeassistant.helpers import intent, template
 
-from .const import CONF_BASE_CONTEXT, CONF_LLM_HASS_API, CONF_PROMPT, DEFAULT_PROMPT, DOMAIN
+from .const import (CONF_BASE_CONTEXT, CONF_LLM_HASS_API, CONF_MAX_TOKENS,
+                    CONF_PROMPT, CONF_TEMPERATURE, DEFAULT_MAX_TOKENS,
+                    DEFAULT_PROMPT, DEFAULT_TEMPERATURE, DOMAIN)
 from .coordinator import MammouthDataUpdateCoordinator
 from .ha_tools import HA_TOOLS_SCHEMA, async_dispatch_tool
 from .memory import MammouthMemory
@@ -31,11 +32,8 @@ _LOGGER = logging.getLogger(__name__)
 # éviter une boucle infinie si le modèle s'entête à appeler des outils.
 MAX_TOOL_ITERATIONS = 8
 
-# Nombre de tours (paires user/assistant) conservés en mémoire par conversation.
-# On ne garde que le texte final de chaque tour (pas les appels d'outils
-# intermédiaires) : ça reste léger et évite tout risque de laisser un
-# tool_call sans réponse associée quand on tronque l'historique.
-MAX_HISTORY_TURNS = 10
+# Nombre de tours conservés par fil : voir memory.MAX_HISTORY_MESSAGES,
+# la troncature et la persistance sont gérées par MammouthMemory.
 
 TOOLS_SYSTEM_SUFFIX = (
     "\n\n---\n"
@@ -55,11 +53,24 @@ TOOLS_SYSTEM_SUFFIX = (
     "réellement (via get_ha_overview, search_entities ou get_entity_details). Si une recherche dans un "
     "domaine ne donne rien, élargis avec search_entities SANS filtre de domaine avant de conclure que "
     "l'entité n'existe pas : elle peut être dans un domaine différent de celui attendu (ex: switch au "
-    "lieu de light).\n"
-    "3. Quand l'utilisateur donne un ordre direct et sans ambiguïté (« éteins X », « allume Y », "
-    "« monte le volet Z »), exécute l'action tout de suite avec call_service : ne redemande PAS "
-    "confirmation avant d'agir. Ne demande une clarification que si plusieurs entités correspondent "
-    "de façon ambiguë, ou si l'action est destructrice (ex: suppression d'une automatisation).\n"
+    "lieu de light). Si un nom donné par l'utilisateur ne matche rien exactement, réessaie avec "
+    "search_entities sur un mot-clé plus court (ex: 'cabanon' plutôt que la phrase complète) avant "
+    "de dire que ça n'existe pas.\n"
+    "2b. Dès que list_automations ou get_automation te donne un entity_id pour une automatisation, "
+    "RÉUTILISE ce entity_id exact pour toute action suivante sur cette même automatisation (assign_entity_area, "
+    "call_service...). Ne le redéduis JAMAIS toi-même en transformant l'alias en minuscules avec des "
+    "underscores : Home Assistant peut générer un entity_id différent (accents, doublons, suffixe "
+    "numérique). Si un entity_id que tu as déduit toi-même échoue, ne réessaie pas une autre variante "
+    "déduite : rappelle get_automation ou list_automations pour obtenir le vrai entity_id.\n"
+    "3. Distingue bien deux types d'actions :\n"
+    "   a) Contrôle direct d'un appareil (call_service) : si l'ordre est clair et sans ambiguïté "
+    "(« éteins X », « allume Y »), exécute-le tout de suite, sans redemander confirmation.\n"
+    "   b) Changement de configuration (create_automation, update_automation, delete_automation, "
+    "create_script, create_dashboard, assign_entity_area) : décris D'ABORD précisément ce que tu "
+    "vas faire (quoi, sur quelle entité/zone/automatisation) et attends une confirmation EXPLICITE "
+    "de l'utilisateur pour CE changement précis, sauf si sa demande initiale nommait déjà "
+    "exactement cette action. Un « oui » donné à « veux-tu que je regarde/analyse ? » n'est PAS "
+    "une confirmation pour agir ensuite : ça n'autorise que la lecture, pas la modification.\n"
     "4. Quand on te demande des suggestions d'amélioration ou d'automatisation, explore d'abord "
     "l'instance pour proposer des idées pertinentes et concrètes plutôt que génériques.\n"
     "5. Après toute création, modification ou action, résume clairement ce qui a été fait (nom, "
@@ -71,7 +82,20 @@ TOOLS_SYSTEM_SUFFIX = (
     "configuration (ex: 'le plafonnier du bureau est un switch, pas une light'), une préférence "
     "exprimée, ou un fait stable sur l'installation. N'utilise PAS remember_fact pour un état "
     "temporaire (une lumière allumée/éteinte change tout le temps, ce n'est pas un souvenir utile) "
-    "ni pour une information déjà présente dans le contexte de base ci-dessus."
+    "ni pour une information déjà présente dans le contexte de base ci-dessus.\n"
+    "9. Ne dis JAMAIS qu'une action a réussi (créée, modifiée, assignée, supprimée, exécutée) sans "
+    "avoir réellement appelé l'outil correspondant et reçu un résultat avec success:true. S'il "
+    "n'existe aucun outil pour faire ce qu'on te demande, dis-le clairement plutôt que d'affirmer "
+    "l'avoir fait.\n"
+    "10. Si tu découvres qu'un entity_id ne correspond pas à ce qu'on pourrait naïvement déduire du "
+    "nom (ex: suffixe numérique inattendu, domaine surprenant), retiens cette correspondance avec "
+    "remember_fact pour ne pas avoir à la rechercher à chaque fois dans les prochaines conversations.\n"
+    "11. get_automation ne fait que LIRE et ne corrige jamais le fichier réel sur disque : si son "
+    "résultat contient schema_issue_on_disk: true, la config a un vrai problème non résolu, même si "
+    "l'affichage te semble propre. Pour réellement corriger, appelle update_automation sur cette "
+    "automatisation (même sans changer aucun champ) — lui seul réécrit le fichier. Ne dis jamais "
+    "qu'un problème de configuration est résolu sur la seule base d'un get_automation ou "
+    "list_automations qui a réussi : ce sont des lectures, pas des réparations."
 )
 
 MEMORY_TOOLS_SCHEMA: list[dict] = [
@@ -137,14 +161,10 @@ class MammouthConversationEntity(ConversationEntity):
         self._attr_name = f"Mammouth AI ({config_entry.title})"
         self._attr_unique_id = config_entry.entry_id
 
-        # Historique conversationnel léger, gardé en mémoire par conversation_id.
-        # Chaque entrée est une paire {"role": "user"/"assistant", "content": str}.
-        # On ne persiste pas les tool_calls intermédiaires : uniquement le
-        # message utilisateur et la réponse finale de chaque tour.
-        self._histories: dict[str, list[dict]] = {}
-
-        # Mémoire persistante inter-conversations (souvenirs auto-appris),
-        # stockée sur disque via le Store natif de Home Assistant.
+        # Mémoire persistante : souvenirs auto-appris ET historique de
+        # conversation par utilisateur, stockés sur disque via le Store
+        # natif de Home Assistant (voir memory.py pour les détails de
+        # coût/persistance).
         self._memory = MammouthMemory(hass, config_entry.entry_id)
 
         if config_entry.options.get(CONF_LLM_HASS_API, False):
@@ -166,9 +186,20 @@ class MammouthConversationEntity(ConversationEntity):
         """Handle a conversation message."""
         intent_response = intent.IntentResponse(language=user_input.language)
 
-        # Home Assistant fournit un conversation_id pour enchaîner les tours
-        # d'une même conversation ; on en génère un si c'est le premier message.
-        conversation_id = user_input.conversation_id or uuid.uuid4().hex
+        # Fil de conversation basé sur la PERSONNE, pas sur la fenêtre/session :
+        # tant que c'est le même utilisateur HA, l'historique continue, qu'on
+        # ferme et rouvre une fenêtre Assist ou qu'on en ouvre une nouvelle.
+        # Un conversation_id est quand même retourné (protocole HA), mais on
+        # l'aligne sur ce même identifiant plutôt que sur celui, éphémère,
+        # fourni par la fenêtre.
+        if user_input.context and user_input.context.user_id:
+            thread_key = f"user_{user_input.context.user_id}"
+        else:
+            # Pas d'utilisateur identifié (ex: appel automatisé) : un seul
+            # fil partagé, à défaut de mieux.
+            thread_key = "anonymous"
+
+        conversation_id = user_input.conversation_id or thread_key
 
         # Obtenir le prompt système
         system_prompt = self._config_entry.options.get(
@@ -226,8 +257,9 @@ class MammouthConversationEntity(ConversationEntity):
                 "(à respecter comme un cadre stable) :\n" + base_context
             )
 
-        # Historique propre (sans tool_calls) de cette conversation
-        history = self._histories.get(conversation_id, [])
+        # Historique propre (sans tool_calls) de cette conversation, lu
+        # depuis la mémoire persistante (survit aux redémarrages).
+        history = await self._memory.async_get_history(thread_key)
 
         # Construire les messages pour l'API : system + historique + message courant
         messages: list[dict] = (
@@ -238,20 +270,28 @@ class MammouthConversationEntity(ConversationEntity):
 
         tools = (HA_TOOLS_SCHEMA + MEMORY_TOOLS_SCHEMA) if tools_enabled else None
 
+        # Ces réglages existent dans le formulaire d'options depuis le début,
+        # mais n'étaient jamais transmis à l'API : ils n'avaient aucun effet.
+        extra_params = {
+            "max_tokens": self._config_entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+            "temperature": self._config_entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE),
+        }
+
         _LOGGER.debug("Sending request to Mammouth AI: %s", user_input.text)
 
         try:
-            response_text = await self._async_run_conversation(messages, tools)
+            response_text = await self._async_run_conversation(messages, tools, extra_params)
             _LOGGER.debug("Received response from Mammouth AI: %s", response_text)
             intent_response.async_set_speech(response_text)
 
             # Mettre à jour l'historique propre (uniquement les tours finaux,
-            # jamais les tool_calls intermédiaires) et le tronquer.
+            # jamais les tool_calls intermédiaires) ; la troncature et
+            # l'écriture différée sont gérées par MammouthMemory.
             history = history + [
                 {"role": "user", "content": user_input.text},
                 {"role": "assistant", "content": response_text},
             ]
-            self._histories[conversation_id] = history[-(MAX_HISTORY_TURNS * 2):]
+            await self._memory.async_save_history(thread_key, history)
 
         except HomeAssistantError as err:
             _LOGGER.error("Error processing conversation: %s", err)
@@ -266,12 +306,13 @@ class MammouthConversationEntity(ConversationEntity):
         )
 
     async def _async_run_conversation(
-        self, messages: list[dict], tools: list[dict] | None
+        self, messages: list[dict], tools: list[dict] | None, extra_params: dict | None = None
     ) -> str:
         """Run the model, executing any tool calls it requests, until a final answer."""
+        extra_params = extra_params or {}
         for _ in range(MAX_TOOL_ITERATIONS):
             message = await self.coordinator.async_chat_completion(
-                messages, tools=tools
+                messages, tools=tools, **extra_params
             )
             tool_calls = message.get("tool_calls")
 
