@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from collections import defaultdict
+import uuid
 from typing import Literal
 
 from homeassistant.components.conversation import (
     ChatLog,
     ConversationEntity,
+    ConversationEntityFeature,
     ConversationInput,
     ConversationResult,
 )
@@ -18,25 +20,105 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, TemplateError
 from homeassistant.helpers import intent, template
 
-from .const import (
-    CONF_ENTITY_DOMAINS,
-    CONF_EXCLUDE_AREAS,
-    CONF_LLM_HASS_API,
-    CONF_MAX_ENTITIES,
-    CONF_MINIMAL_ATTRIBUTES,
-    CONF_PROMPT,
-    CONF_SMART_FILTERING,
-    DEFAULT_ENTITY_DOMAINS,
-    DEFAULT_EXCLUDE_AREAS,
-    DEFAULT_MAX_ENTITIES,
-    DEFAULT_MINIMAL_ATTRIBUTES,
-    DEFAULT_PROMPT,
-    DEFAULT_SMART_FILTERING,
-    DOMAIN,
-)
+from .const import CONF_BASE_CONTEXT, CONF_LLM_HASS_API, CONF_PROMPT, DEFAULT_PROMPT, DOMAIN
 from .coordinator import MammouthDataUpdateCoordinator
+from .ha_tools import HA_TOOLS_SCHEMA, async_dispatch_tool
+from .memory import MammouthMemory
 
 _LOGGER = logging.getLogger(__name__)
+
+# Nombre maximum d'aller-retours modèle <-> outils avant d'abandonner, pour
+# éviter une boucle infinie si le modèle s'entête à appeler des outils.
+MAX_TOOL_ITERATIONS = 8
+
+# Nombre de tours (paires user/assistant) conservés en mémoire par conversation.
+# On ne garde que le texte final de chaque tour (pas les appels d'outils
+# intermédiaires) : ça reste léger et évite tout risque de laisser un
+# tool_call sans réponse associée quand on tronque l'historique.
+MAX_HISTORY_TURNS = 10
+
+TOOLS_SYSTEM_SUFFIX = (
+    "\n\n---\n"
+    "Tu es aussi un assistant de configuration et de contrôle pour cette instance Home "
+    "Assistant. Tu as accès à des outils pour :\n"
+    "- explorer les zones, appareils et entités et leur état actuel ;\n"
+    "- consulter les automatisations, scripts et dashboards déjà existants ;\n"
+    "- créer, modifier ou supprimer des automatisations et des scripts (effet immédiat, sans redémarrage) ;\n"
+    "- générer des dashboards ;\n"
+    "- agir immédiatement sur un appareil (allumer/éteindre/basculer/régler) via call_service ;\n"
+    "- mémoriser durablement une information avec remember_fact, pour t'en souvenir dans les "
+    "conversations futures (pas seulement celle-ci).\n"
+    "Règles à suivre :\n"
+    "1. Base toujours tes réponses sur l'état réel de l'installation : utilise les outils de lecture "
+    "avant de proposer, créer ou contrôler quoi que ce soit, ne suppose jamais l'existence d'une entité.\n"
+    "2. Avant d'agir sur une entité ou de créer une automatisation/script, vérifie que l'entity_id existe "
+    "réellement (via get_ha_overview, search_entities ou get_entity_details). Si une recherche dans un "
+    "domaine ne donne rien, élargis avec search_entities SANS filtre de domaine avant de conclure que "
+    "l'entité n'existe pas : elle peut être dans un domaine différent de celui attendu (ex: switch au "
+    "lieu de light).\n"
+    "3. Quand l'utilisateur donne un ordre direct et sans ambiguïté (« éteins X », « allume Y », "
+    "« monte le volet Z »), exécute l'action tout de suite avec call_service : ne redemande PAS "
+    "confirmation avant d'agir. Ne demande une clarification que si plusieurs entités correspondent "
+    "de façon ambiguë, ou si l'action est destructrice (ex: suppression d'une automatisation).\n"
+    "4. Quand on te demande des suggestions d'amélioration ou d'automatisation, explore d'abord "
+    "l'instance pour proposer des idées pertinentes et concrètes plutôt que génériques.\n"
+    "5. Après toute création, modification ou action, résume clairement ce qui a été fait (nom, "
+    "entity_id, effet) en langage simple.\n"
+    "6. Si un outil retourne une erreur, explique-la à l'utilisateur et corrige ta requête si possible.\n"
+    "7. Tu as accès à l'historique de cette conversation : ne redemande pas une information que "
+    "l'utilisateur ou toi-même avez déjà donnée plus haut dans l'échange.\n"
+    "8. Utilise remember_fact pour retenir durablement : une correction de l'utilisateur sur ta "
+    "configuration (ex: 'le plafonnier du bureau est un switch, pas une light'), une préférence "
+    "exprimée, ou un fait stable sur l'installation. N'utilise PAS remember_fact pour un état "
+    "temporaire (une lumière allumée/éteinte change tout le temps, ce n'est pas un souvenir utile) "
+    "ni pour une information déjà présente dans le contexte de base ci-dessus."
+)
+
+MEMORY_TOOLS_SCHEMA: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "Enregistre durablement une information apprise pendant cette conversation, pour "
+                "t'en souvenir dans TOUTES les conversations futures, pas seulement celle-ci. "
+                "Utilise ceci pour les corrections de l'utilisateur, ses préférences, ou des faits "
+                "stables sur son installation. Ne pas utiliser pour un état temporaire (une lumière "
+                "allumée/éteinte change tout le temps, ce n'est pas un souvenir utile)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Le fait à retenir, en une phrase claire et autonome.",
+                    }
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_remembered_facts",
+            "description": "Liste tout ce qui a été retenu durablement des conversations précédentes.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_fact",
+            "description": "Supprime un souvenir précis par son id (voir list_remembered_facts).",
+            "parameters": {
+                "type": "object",
+                "properties": {"fact_id": {"type": "string"}},
+                "required": ["fact_id"],
+            },
+        },
+    },
+]
 
 
 class MammouthConversationEntity(ConversationEntity):
@@ -44,6 +126,7 @@ class MammouthConversationEntity(ConversationEntity):
 
     def __init__(
         self,
+        hass: HomeAssistant,
         coordinator: MammouthDataUpdateCoordinator,
         config_entry: ConfigEntry,
     ) -> None:
@@ -53,6 +136,19 @@ class MammouthConversationEntity(ConversationEntity):
         self._config_entry = config_entry
         self._attr_name = f"Mammouth AI ({config_entry.title})"
         self._attr_unique_id = config_entry.entry_id
+
+        # Historique conversationnel léger, gardé en mémoire par conversation_id.
+        # Chaque entrée est une paire {"role": "user"/"assistant", "content": str}.
+        # On ne persiste pas les tool_calls intermédiaires : uniquement le
+        # message utilisateur et la réponse finale de chaque tour.
+        self._histories: dict[str, list[dict]] = {}
+
+        # Mémoire persistante inter-conversations (souvenirs auto-appris),
+        # stockée sur disque via le Store natif de Home Assistant.
+        self._memory = MammouthMemory(hass, config_entry.entry_id)
+
+        if config_entry.options.get(CONF_LLM_HASS_API, False):
+            self._attr_supported_features = ConversationEntityFeature.CONTROL
 
     @property
     def attribution(self) -> str:
@@ -64,387 +160,26 @@ class MammouthConversationEntity(ConversationEntity):
         """Return list of supported languages."""
         return MATCH_ALL
 
-    def _extract_relevant_domains_from_query(self, query: str) -> set[str]:
-        """Extract relevant domains from user query using keyword matching."""
-        domain_keywords = {
-            "light": [
-                # French
-                "lumière",
-                "éclairage",
-                "allume",
-                "éteins",
-                "lampe",
-                # English
-                "light",
-                "lamp",
-                "turn on",
-                "turn off",
-                "illuminate",
-                # Spanish
-                "luz",
-                "lámpara",
-                "encender",
-                "apagar",
-                "iluminar",
-                # German
-                "licht",
-                "lampe",
-                "anschalten",
-                "ausschalten",
-                # Italian
-                "luce",
-                "lampada",
-                "accendi",
-                "spegni",
-                # Portuguese
-                "luz",
-                "lâmpada",
-                "ligar",
-                "desligar",
-                # Dutch
-                "licht",
-                "lamp",
-                "aan",
-                "uit",
-            ],
-            "switch": [
-                # French
-                "interrupteur",
-                "prise",
-                "allume",
-                "éteins",
-                # English
-                "switch",
-                "plug",
-                "outlet",
-                "turn on",
-                "turn off",
-                # Spanish
-                "interruptor",
-                "enchufe",
-                "encender",
-                "apagar",
-                # German
-                "schalter",
-                "steckdose",
-                "anschalten",
-                "ausschalten",
-                # Italian
-                "interruttore",
-                "presa",
-                "accendi",
-                "spegni",
-                # Portuguese
-                "interruptor",
-                "tomada",
-                "ligar",
-                "desligar",
-                # Dutch
-                "schakelaar",
-                "stopcontact",
-                "aan",
-                "uit",
-            ],
-            "sensor": [
-                # French
-                "température",
-                "humidité",
-                "capteur",
-                "mesure",
-                # English
-                "temperature",
-                "humidity",
-                "sensor",
-                "measure",
-                # Spanish
-                "temperatura",
-                "humedad",
-                "sensor",
-                "medida",
-                # German
-                "temperatur",
-                "feuchtigkeit",
-                "sensor",
-                "messung",
-                # Italian
-                "temperatura",
-                "umidità",
-                "sensore",
-                "misura",
-                # Portuguese
-                "temperatura",
-                "umidade",
-                "sensor",
-                "medida",
-                # Dutch
-                "temperatuur",
-                "vochtigheid",
-                "sensor",
-                "meting",
-            ],
-            "binary_sensor": [
-                # French
-                "détecteur",
-                "mouvement",
-                "porte",
-                "fenêtre",
-                "ouvert",
-                "fermé",
-                # English
-                "detector",
-                "motion",
-                "door",
-                "window",
-                "open",
-                "closed",
-                # Spanish
-                "detector",
-                "movimiento",
-                "puerta",
-                "ventana",
-                "abierto",
-                "cerrado",
-                # German
-                "detektor",
-                "bewegung",
-                "tür",
-                "fenster",
-                "offen",
-                "geschlossen",
-                # Italian
-                "rilevatore",
-                "movimento",
-                "porta",
-                "finestra",
-                "aperto",
-                "chiuso",
-                # Portuguese
-                "detector",
-                "movimento",
-                "porta",
-                "janela",
-                "aberto",
-                "fechado",
-                # Dutch
-                "detector",
-                "beweging",
-                "deur",
-                "raam",
-                "open",
-                "gesloten",
-            ],
-            "climate": [
-                # French
-                "chauffage",
-                "climatisation",
-                "thermostat",
-                "température",
-                # English
-                "heating",
-                "air conditioning",
-                "thermostat",
-                "temperature",
-                # Spanish
-                "calefacción",
-                "aire acondicionado",
-                "termostato",
-                "temperatura",
-                # German
-                "heizung",
-                "klimaanlage",
-                "thermostat",
-                "temperatur",
-                # Italian
-                "riscaldamento",
-                "aria condizionata",
-                "termostato",
-                "temperatura",
-                # Portuguese
-                "aquecimento",
-                "ar condicionado",
-                "termostato",
-                "temperatura",
-                # Dutch
-                "verwarming",
-                "airconditioning",
-                "thermostaat",
-                "temperatuur",
-            ],
-            "cover": [
-                # French
-                "volet",
-                "store",
-                "rideau",
-                "garage",
-                # English
-                "cover",
-                "blind",
-                "curtain",
-                "shutter",
-                "garage",
-                # Spanish
-                "persiana",
-                "cortina",
-                "toldo",
-                "garaje",
-                # German
-                "jalousie",
-                "vorhang",
-                "rollladen",
-                "garage",
-                # Italian
-                "tapparella",
-                "tenda",
-                "persiana",
-                "garage",
-                # Portuguese
-                "persiana",
-                "cortina",
-                "toldo",
-                "garagem",
-                # Dutch
-                "jaloezie",
-                "gordijn",
-                "rolluik",
-                "garage",
-            ],
-        }
-
-        query_lower = query.lower()
-        relevant_domains = set()
-
-        for domain, keywords in domain_keywords.items():
-            if any(keyword in query_lower for keyword in keywords):
-                relevant_domains.add(domain)
-
-        return relevant_domains
-
-    def _filter_entities_by_area(self, states, exclude_areas: list[str]):
-        """Filter entities by area."""
-        if not exclude_areas:
-            return states
-
-        filtered_states = []
-        for state in states:
-            area_id = None
-            if hasattr(state, "attributes") and "area_id" in state.attributes:
-                area_id = state.attributes["area_id"]
-
-            if area_id not in exclude_areas:
-                filtered_states.append(state)
-
-        return filtered_states
-
-    def _get_essential_attributes(self, state, minimal: bool):
-        """Get essential attributes only, reducing token usage."""
-        base_attrs = {
-            "friendly_name": state.attributes.get("friendly_name", state.entity_id),
-            "unit_of_measurement": state.attributes.get("unit_of_measurement", ""),
-            "device_class": state.attributes.get("device_class", ""),
-        }
-
-        if not minimal:
-            base_attrs.update(
-                {
-                    "icon": state.attributes.get("icon", ""),
-                    "state_class": state.attributes.get("state_class", ""),
-                }
-            )
-
-        return base_attrs
-
-    def _filter_and_prepare_entities(self, user_query: str):
-        """Filter and prepare entities for API call with optimizations."""
-        # Get configuration options
-        config_options = self._config_entry.options
-        max_entities = config_options.get(CONF_MAX_ENTITIES, DEFAULT_MAX_ENTITIES)
-        allowed_domains = config_options.get(
-            CONF_ENTITY_DOMAINS, DEFAULT_ENTITY_DOMAINS
-        )
-        exclude_areas = config_options.get(CONF_EXCLUDE_AREAS, DEFAULT_EXCLUDE_AREAS)
-        smart_filtering = config_options.get(
-            CONF_SMART_FILTERING, DEFAULT_SMART_FILTERING
-        )
-        minimal_attributes = config_options.get(
-            CONF_MINIMAL_ATTRIBUTES, DEFAULT_MINIMAL_ATTRIBUTES
-        )
-
-        all_states = self.hass.states.async_all()
-        _LOGGER.debug("Total entities in HA: %d", len(all_states))
-
-        # Filter by area first
-        filtered_states = self._filter_entities_by_area(all_states, exclude_areas)
-
-        # Filter by domain
-        domain_filtered_states = [
-            state
-            for state in filtered_states
-            if state.domain in allowed_domains
-            and state.state not in ["unknown", "unavailable"]
-        ]
-
-        # Smart filtering based on user query
-        if smart_filtering:
-            relevant_domains = self._extract_relevant_domains_from_query(user_query)
-            if relevant_domains:
-                smart_filtered_states = [
-                    state
-                    for state in domain_filtered_states
-                    if state.domain in relevant_domains
-                ]
-                # If smart filtering yields results, use it;
-                # otherwise fall back to all domains
-                if smart_filtered_states:
-                    domain_filtered_states = smart_filtered_states
-                    _LOGGER.debug(
-                        "Smart filtering applied: %s domains", relevant_domains
-                    )
-
-        # Limit total number of entities
-        if len(domain_filtered_states) > max_entities:
-            domain_filtered_states = domain_filtered_states[:max_entities]
-            _LOGGER.debug("Limited entities to %d", max_entities)
-
-        # Prepare entities with reduced attributes
-        entities_by_domain = defaultdict(list)
-        for state in domain_filtered_states:
-            essential_attrs = self._get_essential_attributes(state, minimal_attributes)
-            entity_data = {
-                "entity_id": state.entity_id,
-                "name": essential_attrs.get("friendly_name", state.entity_id),
-                "state": state.state,
-                "unit": essential_attrs.get("unit_of_measurement", ""),
-            }
-
-            # Add device_class only if it exists and not minimal
-            if not minimal_attributes and essential_attrs.get("device_class"):
-                entity_data["device_class"] = essential_attrs["device_class"]
-
-            entities_by_domain[state.domain].append(entity_data)
-
-        _LOGGER.debug(
-            "Filtered entities by domain: %s",
-            {domain: len(entities) for domain, entities in entities_by_domain.items()},
-        )
-
-        return dict(entities_by_domain), sum(
-            len(entities) for entities in entities_by_domain.values()
-        )
-
     async def _async_handle_message(
         self, user_input: ConversationInput, chat_log: ChatLog
     ) -> ConversationResult:
         """Handle a conversation message."""
         intent_response = intent.IntentResponse(language=user_input.language)
 
+        # Home Assistant fournit un conversation_id pour enchaîner les tours
+        # d'une même conversation ; on en génère un si c'est le premier message.
+        conversation_id = user_input.conversation_id or uuid.uuid4().hex
+
         # Obtenir le prompt système
-        system_prompt = self._config_entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
+        system_prompt = self._config_entry.options.get(
+            CONF_PROMPT, DEFAULT_PROMPT
+        )
 
-        # Si l'option d'API HA est activée, traiter les templates
-        llm_hass_api_enabled = self._config_entry.options.get(CONF_LLM_HASS_API, True)
-        _LOGGER.debug("LLM HASS API enabled: %s", llm_hass_api_enabled)
+        tools_enabled = self._config_entry.options.get(CONF_LLM_HASS_API, False)
 
-        if llm_hass_api_enabled:
+        # Si l'option d'accès à Home Assistant est activée, traiter les templates
+        # et enrichir le prompt avec les instructions liées aux outils.
+        if tools_enabled:
             try:
                 # Obtenir les informations utilisateur
                 user_name = "Utilisateur"
@@ -456,45 +191,14 @@ class MammouthConversationEntity(ConversationEntity):
                         user_name = user.name
 
                 # Rendre le template avec les variables HA
-                ha_name = self.hass.config.location_name or "Jean Claude"
-
-                # Utiliser le nouveau système de filtrage optimisé
-                entities_by_domain, entities_count = self._filter_and_prepare_entities(
-                    user_input.text
-                )
-
-                _LOGGER.debug("Optimized entities count: %d", entities_count)
-                if entities_by_domain:
-                    _LOGGER.debug(
-                        "Entities by domain: %s",
-                        {
-                            domain: len(entities)
-                            for domain, entities in entities_by_domain.items()
-                        },
-                    )
-
-                template_vars = {
-                    "ha_name": ha_name,
-                    "user_name": user_name,
-                    "entities_by_domain": entities_by_domain,
-                    "entities_count": entities_count,
-                }
-                _LOGGER.debug(
-                    "Template variables: ha_name=%s, user_name=%s, entities_count=%d",
-                    ha_name,
-                    user_name,
-                    entities_count,
-                )
-
                 system_prompt = template.Template(
                     system_prompt, self.hass
-                ).async_render(template_vars, parse_result=False)
-
-                _LOGGER.debug(
-                    "Rendered system prompt length: %d characters", len(system_prompt)
-                )
-                _LOGGER.debug(
-                    "Rendered system prompt (first 500 chars): %s", system_prompt[:500]
+                ).async_render(
+                    {
+                        "ha_name": self.hass.config.location_name,
+                        "user_name": user_name,
+                    },
+                    parse_result=False,
                 )
             except TemplateError as err:
                 _LOGGER.error("Error rendering prompt template: %s", err)
@@ -504,30 +208,50 @@ class MammouthConversationEntity(ConversationEntity):
                 )
                 return ConversationResult(
                     response=intent_response,
+                    conversation_id=conversation_id,
                 )
 
-        # Construire les messages pour l'API
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input.text},
-        ]
+            system_prompt += TOOLS_SYSTEM_SUFFIX
+
+            await self._memory.async_load()
+            system_prompt += self._memory.facts_as_prompt_block()
+
+        # Le contexte de base (défini par l'utilisateur, façon "Projet" ou
+        # "Mammouth personnalisé") s'applique toujours, indépendamment de
+        # l'accès aux outils Home Assistant.
+        base_context = (self._config_entry.options.get(CONF_BASE_CONTEXT) or "").strip()
+        if base_context:
+            system_prompt += (
+                "\n\n---\nContexte de base défini par l'utilisateur pour cet assistant "
+                "(à respecter comme un cadre stable) :\n" + base_context
+            )
+
+        # Historique propre (sans tool_calls) de cette conversation
+        history = self._histories.get(conversation_id, [])
+
+        # Construire les messages pour l'API : system + historique + message courant
+        messages: list[dict] = (
+            [{"role": "system", "content": system_prompt}]
+            + list(history)
+            + [{"role": "user", "content": user_input.text}]
+        )
+
+        tools = (HA_TOOLS_SCHEMA + MEMORY_TOOLS_SCHEMA) if tools_enabled else None
 
         _LOGGER.debug("Sending request to Mammouth AI: %s", user_input.text)
 
         try:
-            # Obtenir l'ID utilisateur pour la mémoire
-            user_id = None
-            if user_input.context and user_input.context.user_id:
-                user_id = user_input.context.user_id
-
-            # Appel à l'API Mammouth avec mémoire
-            response_text = await self.coordinator.async_chat_completion_with_memory(
-                messages, user_id=user_id, conversation_id=user_input.conversation_id
-            )
-
+            response_text = await self._async_run_conversation(messages, tools)
             _LOGGER.debug("Received response from Mammouth AI: %s", response_text)
-
             intent_response.async_set_speech(response_text)
+
+            # Mettre à jour l'historique propre (uniquement les tours finaux,
+            # jamais les tool_calls intermédiaires) et le tronquer.
+            history = history + [
+                {"role": "user", "content": user_input.text},
+                {"role": "assistant", "content": response_text},
+            ]
+            self._histories[conversation_id] = history[-(MAX_HISTORY_TURNS * 2):]
 
         except HomeAssistantError as err:
             _LOGGER.error("Error processing conversation: %s", err)
@@ -538,7 +262,71 @@ class MammouthConversationEntity(ConversationEntity):
 
         return ConversationResult(
             response=intent_response,
+            conversation_id=conversation_id,
         )
+
+    async def _async_run_conversation(
+        self, messages: list[dict], tools: list[dict] | None
+    ) -> str:
+        """Run the model, executing any tool calls it requests, until a final answer."""
+        for _ in range(MAX_TOOL_ITERATIONS):
+            message = await self.coordinator.async_chat_completion(
+                messages, tools=tools
+            )
+            tool_calls = message.get("tool_calls")
+
+            if not tool_calls:
+                return message.get("content") or ""
+
+            # On rajoute le message assistant (avec ses tool_calls) à l'historique
+            # de travail de ce tour (pas à l'historique persistant entre tours).
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content"),
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for call in tool_calls:
+                function = call.get("function", {})
+                fn_name = function.get("name")
+                raw_args = function.get("arguments") or "{}"
+                try:
+                    fn_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    fn_args = {}
+                    _LOGGER.warning(
+                        "Arguments JSON invalides pour l'outil %s: %s", fn_name, raw_args
+                    )
+
+                _LOGGER.debug("Executing tool %s with args %s", fn_name, fn_args)
+                result = await self._async_dispatch_tool(fn_name, fn_args)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    }
+                )
+
+        _LOGGER.warning("Maximum tool iterations reached without a final answer")
+        return (
+            "Désolé, je n'ai pas réussi à conclure cette demande après plusieurs "
+            "étapes d'analyse. Peux-tu reformuler ou préciser ta demande ?"
+        )
+
+    async def _async_dispatch_tool(self, fn_name: str, fn_args: dict) -> object:
+        """Route un appel d'outil vers ha_tools (état HA) ou memory (souvenirs)."""
+        if fn_name == "remember_fact":
+            return await self._memory.async_add_fact(fn_args.get("text", ""))
+        if fn_name == "list_remembered_facts":
+            facts = await self._memory.async_list_facts()
+            return {"facts": facts}
+        if fn_name == "forget_fact":
+            return await self._memory.async_remove_fact(fn_args.get("fact_id", ""))
+        return await async_dispatch_tool(self.hass, fn_name, fn_args)
 
 
 async def async_setup_entry(
@@ -548,6 +336,6 @@ async def async_setup_entry(
 ) -> None:
     """Set up Mammouth AI conversation platform."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id]
-    entity = MammouthConversationEntity(coordinator, config_entry)
+    entity = MammouthConversationEntity(hass, coordinator, config_entry)
     async_add_entities([entity])
     _LOGGER.debug("Mammouth AI conversation entity added")
